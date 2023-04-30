@@ -1,0 +1,136 @@
+---
+title: "Graphical Simulator Generator"
+author: "Bob and Associates"
+date: "2023-04-30"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Here we attempt to implement Judea Pearl's "[Multistage Simpson's Paradox machine](http://ftp.cs.ucla.edu/pub/stat_ser/r414-reprint.pdf)" (Figure 3).
+
+
+```{r libraries, warn=FALSE}
+library(dplyr)
+library(ggplot2)
+library(bnlearn)
+library(Rgraphviz)
+```
+
+(The plot of the graph is the only thing that depends on Rgraphviz, which needs to be installed from Bioconductor, or bnlearn which also has some complicated dependencies as I recall. You don't need these packages to run the simulation.)
+
+Define the causal graph and display it:
+
+```{r the_graph}
+
+dependency_str <-  "[Z1]
+                    [Z3 | Z1       ]
+                    [Z3b| Z1       ]
+                    [Z2 | Z3  : Z3b]
+                    [Z5 | Z3       ]
+                    [Z5b| Z3b      ]
+                    [Z4 | Z5  : Z5b]
+                    [X  | Z5b      ]
+                    [Y  | X   : Z5 ]"  %>% gsub(' ', '', .)
+
+node_descriptions <- dependency_str %>% strsplit('\n') %>% '[['(1)
+
+tree = model2network(node_descriptions %>% paste0(collapse=''))
+graphviz.plot(tree)
+
+```
+
+Parse the graph to list the parents of each node.
+
+```{r parse_graph}
+parse_node_str <- function(node_str){
+  # node <- node_str %>% gsub("\\[([^:]+).*\\]", "\\1", .)
+  parts <- node_str %>%
+              gsub('[', '', ., fixed=TRUE) %>% 
+              gsub(']', '', ., fixed=TRUE) %>% 
+              strsplit('\\| ?') %>% '[['(1) %>% 
+              strsplit('\\: ?')
+  
+  node <- list(id = parts[[1]])
+  
+  if (length(parts) > 1){
+    node['parents'] <- parts[2]
+  }
+  
+  node
+}
+
+parsed_nodes <- node_descriptions %>% lapply(parse_node_str)
+
+node_list <- parsed_nodes %>% lapply(function(node) node$parents)
+names(node_list) <- parsed_nodes %>% lapply(function(node) node$id)
+
+```
+
+Simulate data according to the dependency relationships in the graph. First find the nodes with no parents and give them random values. Then find the nodes whose parents have already been simulated, and give them values using a function that depends on the parents (here we use simple linear functions, but other functions should be possible). Repeat until all nodes have been added as columns in the dataframe of simulated data.
+
+```{r sim_data}
+
+gen_fun <- function(data_cols, noise_sd=0.01){
+  M <- data_cols %>% as.data.frame %>% as.matrix
+  num_data_cols <- length(data_cols)
+  beta <- runif(num_data_cols)
+  noise <- rnorm(nrow(M), sd=noise_sd)
+  M %*% beta + noise
+}
+
+N <- 100
+
+columns <- list()
+
+remaining_nodes <- node_list
+
+while (length(remaining_nodes) > 0){
+  for (node_name in names(remaining_nodes)){
+    node <- remaining_nodes[[node_name]]
+    if (length(node) == 0){
+      # no dependencies
+	  print(sprintf("Adding root node %s", node_name))
+      columns[[node_name]] = runif(N)
+      remaining_nodes[[node_name]] <- NULL
+    } else if ( length(setdiff(names(node), names(remaining_nodes))) == 0 ) {
+      # all dependencies are already in the data
+	  print(sprintf("Adding dependent node %s", node_name))
+      columns[[node_name]] = gen_fun( columns[unlist(node)] )
+	  remaining_nodes[node_name] <- NULL
+    } else {
+      print(sprintf("Starting over for node %s", node_name))
+	}
+    # keep going
+ }
+}
+
+
+df <- as.data.frame(columns)
+```
+
+This is what the resulting dataframe looks like:
+```{r examine_df}
+df %>% head
+```
+
+Now we can test whether the reversals we are looking for in the coefficient of 'X' actually happen. If the confounding is correctly implemented, we expect to see the sign of the coefficient of 'X' flip back and forth between negative and positive as we add the covariates to the analysis in order.
+
+```{r test_for_reversals}
+
+coef( lm(Y ~ X, df) )['X']
+coef( lm(Y ~ X + Z1, df) )['X']
+coef( lm(Y ~ X + Z1 + Z2, df) )['X']
+coef( lm(Y ~ X + Z1 + Z2 + Z3, df) )['X']
+coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4, df) )['X']
+coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5, df) )['X']
+
+```
+
+
+So far we have good news and bad news: We can autogenerate data from a given causal graph by walking down the causal DAG and applying a node-wise data generation function (or functions). Now if we can only get the simulated data to actually capture the demonstrable Simpson's paradox relationships we are looking for we'd be golden!
