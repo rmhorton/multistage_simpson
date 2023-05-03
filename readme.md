@@ -13,10 +13,10 @@ coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5, mssp) )['X']
 
 You should see the coefficient of X take the following values, alternating between negative and positive depending on which co-variates are included:
 ```
--1.715871 
- 4.335489 
--2.161678 
- 3.938613 
--0.329377 
- 3.771129
+ 1.137793 
+-0.998305 
+ 1.01994 
+-1.034066 
+ 1.281207 
+-1.007758 
 ```
