@@ -1,0 +1,663 @@
+
+---
+title: "Multi-stage Simpson's Paradox Generator"
+output:
+  html_document:
+    toc: true
+---
+
+
+```{r}
+%md
+
+# Famous Statistical "Paradoxes"
+
+[Simpson’s paradox](https://en.wikipedia.org/wiki/Simpson's_paradox) is the statistical phenomenon whereby the association between a pair of variables (X, Y) reverses sign when we condition on a third variable (Z). It is called a paradox because people often find the results counterintuitive.
+
+[Berkson's Paradox](https://en.wikipedia.org/wiki/Berkson's_paradox) (also called 'conditioning on a collider) is a kind of selection bias where the association between X and Y changes sign when we consider Z because Z ia affected by both X and Y.
+
+See [this blog post](https://www.r-bloggers.com/2022/01/simple-examples-to-understand-what-confounders-colliders-mediators-and-moderators-are-and-how-to-control-for-variables-in-r-with-regression-and-propensity-score-matching/) for a helpful discussion of confounders, colliders, mediators, and moderators.
+
+This is an implementation of Judea Pearl's "[Multi-Stage Simpson's Paradox Generator](http://ftp.cs.ucla.edu/pub/stat_ser/r414-reprint.pdf)" in R. This design uses a structure of confounders and colliders to create a dateaset where the coefficient of X for predicting Y in a linear regression model flips pack and forth between approximately 1 and approximately -1 as we add confounders Z1, Z2, Z3, Z4, and Z5 in that order.
+```
+
+
+```{r}
+%md
+## Define the causal graph
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+
+# Define the causal structure
+msspm_str <-"[Z1            ]
+             [Z3 | Z1       ]
+             [Z3b| Z1       ]
+             [Z2 | Z3  : Z3b]
+             [Z5 | Z3       ]
+             [Z5b| Z3b      ]
+             [Z4 | Z5  : Z5b]
+             [X  | Z5b      ]
+             [Y  | X   : Z5 ]"  %>% gsub('\\s', '', .)
+
+
+parse_graph_str <- function(graph_str){
+  parts <- graph_str %>%
+    strsplit('\\]\\[') %>% '[['(1) %>% 
+    gsub('[', '', ., fixed=TRUE) %>% 
+    gsub(']', '', ., fixed=TRUE) %>% 
+    strsplit('[\\|:] ?')
+  
+  setNames(parts %>% sapply('[', -1), nm=parts %>% sapply('[', 1))
+}
+
+node_parents <- parse_graph_str(msspm_str)
+
+node_parents
+```
+
+
+```{r}
+%md
+
+## Visualize the causal graph
+```
+
+
+```{r}
+library(bnlearn)
+
+network <- msspm_str %>% model2network
+
+# str(network)
+
+node_names <- network$nodes %>% names %>% sort
+node_name_to_number <- setNames(seq_along(node_names), node_names)
+
+nodes <- data.frame(id=node_name_to_number[node_names], label=node_names)
+display(nodes)
+```
+
+
+```{r}
+edges <- network$arcs %>% as.data.frame %>% lapply(function(c) node_name_to_number[c]) %>% as.data.frame
+edges['weight'] = 1
+display(edges)
+```
+
+
+```{r}
+library(sparklyr)
+library(SparkR)
+
+sc <- spark_connect(method='databricks')
+
+edges %>% createDataFrame %>% createOrReplaceTempView(viewName = "mssp_edges")
+
+nodes %>% createDataFrame %>% createOrReplaceTempView(viewName = "mssp_nodes")
+
+```
+
+
+```{r}
+%sql
+
+select * from mssp_nodes
+```
+
+
+```{r}
+%sql
+
+select * from mssp_edges
+```
+
+
+```{r}
+%python
+
+nodes = spark.sql("select * from mssp_nodes").toPandas()
+print('Nodes')
+display(nodes)
+
+edges = spark.sql("select * from mssp_edges").toPandas()
+print('Edges')
+display(edges)
+```
+
+
+```{r}
+%python
+
+def get_vis_js_html(nodes_df, edges_df):
+    """
+    Generate HTML encoding vis_js graph from Pandas dataframes of nodes and edges.
+    """
+    nodes_str = nodes_df.to_json(orient='records')
+    edges_str = edges_df.to_json(orient='records')
+    
+    max_weight = max(edges_df['weight'])
+
+    html_string = ( 
+    '     <style type="text/css">#mynetwork {width: 100%; height: 500px; border: 3px}</style>\n'
+    '     <button onclick=toggle_motion()>Toggle motion</button>\n'
+    '     <div class="slidercontainer">\n'
+    '            <label>minimum edge weight:\n'
+    f'                <input type="range" min="0" max="{max_weight}" value="{max_weight/2}" step="{max_weight/100}" class="slider" id="min_edge_weight">\n'
+    '                <input type="text" id="min_edge_weight_display" size="2">\n'
+    '            </label>\n'
+    '     </div>\n'
+    '     <div id="mynetwork"></div>\n'
+    f'     <script type="text/javascript">NODE_LIST={nodes_str};FULL_EDGE_LIST={edges_str};</script>\n'
+    '     <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>\n'
+    '     <script type="text/javascript">\n'
+    '            const sign_color = {pos:"blue", neg:"red", zero:"black"}\n'
+    '            const options = {physics:{maxVelocity: 1, minVelocity: 0.01}}\n'
+    '            var edgeFilterSlider\n'
+    '            var mynetwork\n'
+    '            var motion_flag = false\n'
+    '            function toggle_motion(){\n'
+    '                motion_flag = !motion_flag\n'
+    '                mynetwork.setOptions( { physics: motion_flag } )\n'
+    '            }\n'
+    '            function edgesFilter(edge){ return edge.value >= edgeFilterSlider.value }\n'
+    '\n'
+    '            function init_network(){\n'
+    '                document.getElementById("min_edge_weight_display").value = 0.5\n'
+    '                document.getElementById("min_edge_weight").onchange = function(){\n'
+    '                    document.getElementById("min_edge_weight_display").value = this.value\n'
+    '                }\n'
+    '\n'
+    '                edgeFilterSlider = document.getElementById("min_edge_weight")\n'
+    '                edgeFilterSlider.addEventListener("change", (e) => {edgesView.refresh()})\n'
+    '                var container = document.getElementById("mynetwork")\n'
+    '                var EDGE_LIST = []\n'
+    '                for (var i = 0; i < FULL_EDGE_LIST.length; i++) {\n'
+    '                    var edge = FULL_EDGE_LIST[i]\n'
+    '                    edge["value"] = Math.abs(edge["weight"])\n'
+    '                    edge["title"] = "weight " + edge["weight"]\n'
+    '                    edge["sign"] = (edge["weight"] < 0) ? "neg" : "pos";\n'
+    '                    edge["color"] = {color: sign_color[edge["sign"]] };\n'
+    '                    edge["arrows"] = "to"\n'
+    '                    EDGE_LIST.push(edge)\n'
+    '                }\n'
+    '\n'
+    '                var nodes = new vis.DataSet(NODE_LIST)\n'
+    '                var edges = new vis.DataSet(EDGE_LIST)\n'
+    '                var nodesView = new vis.DataView(nodes)\n'
+    '                var edgesView = new vis.DataView(edges, { filter: edgesFilter })\n'
+    '                var data = { nodes: nodesView, edges: edgesView }\n'
+    '                mynetwork = new vis.Network(container, data, options)\n'
+    '\n'
+    '            }\n'
+    '            init_network()\n'
+    '     </script>\n'
+
+    )
+    return html_string
+```
+
+
+```{r}
+%python
+
+vis_js_html = get_vis_js_html(nodes, edges)
+
+# from IPython.display import HTML
+# HTML(vis_js_html)
+
+displayHTML(vis_js_html)
+```
+
+
+```{r}
+%md
+
+# Run Multi-stage Simpsons Paradox Generator
+```
+
+
+```{r}
+%md
+## Find the optimal parameters using R's built-in optimizer
+```
+
+
+```{r}
+deserialize_betas <- function(par, node_parents){
+  if ( length(par) != length(unlist(node_parents)))
+    print("Error: length of parameter list does not match length of node parents data structrure.")
+  
+  i <- 1
+  beta_lookup = list()
+  for (node_name in sort(names(node_parents))){
+    ## print(sprintf("node name: %s", node_name))
+    parents <- node_parents[[node_name]]
+    
+    if (length(parents) > 0){ # skip nodes without parents
+      for (parent_name in sort(parents)){
+        ## print(sprintf("    parent name: %s", parent_name))
+        beta_lookup[[node_name]][parent_name] <- par[i]
+        i <- i + 1
+      }
+    }
+
+  }
+  
+  beta_lookup
+}
+
+
+simulation_function <- function(data_cols, beta_vec, noise=0.01){
+  M <- data_cols %>% as.data.frame %>% as.matrix
+  noise <- rnorm(nrow(M), sd=noise)
+  M %*% beta_vec + noise
+}
+
+
+simulate_with_pars <- function(par, node_parents, num_rows=1000, my_noise=0.1){
+
+  betas <- deserialize_betas(par, node_parents)
+  
+  columns <- list()
+  
+  remaining_nodes <- node_parents
+  
+  
+  while (length(remaining_nodes) > 0){
+    for (node_name in names(remaining_nodes)){
+      my_parents <- remaining_nodes[[node_name]]
+      if (length(my_parents) == 0){
+        # no dependencies
+        columns[[node_name]] = runif(num_rows)
+        remaining_nodes[[node_name]] <- NULL
+      } else if ( length(setdiff(my_parents, names(columns))) == 0 ) {
+        # all dependencies are already in the dataset
+        data_cols <- columns[unlist(my_parents)]
+        beta_vec <- betas[[node_name]][names(data_cols)]
+        columns[[node_name]] = simulation_function(data_cols, beta_vec, my_noise)
+  	    remaining_nodes[node_name] <- NULL
+      } else {
+        print(sprintf("Starting over for node %s", node_name))
+  	  }
+    }
+  }
+  
+  as.data.frame(columns)
+}
+
+
+get_coef_vector_for_dataframe <- function(df){
+  c(
+    'just_X' = coef( lm(Y ~ X, df) )['X'],
+    'add_Z1' = coef( lm(Y ~ X + Z1, df) )['X'],
+    'add_Z2' = coef( lm(Y ~ X + Z1 + Z2, df) )['X'],
+    'add_Z3' = coef( lm(Y ~ X + Z1 + Z2 + Z3, df) )['X'],
+    'add_Z4' = coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4, df) )['X'],
+    'add_Z5' = coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5, df) )['X']
+  )
+}
+
+
+v_score <- function(coef_vector){
+  # This is basically Root Mean Squared Error with an extra penalty for getting the signs wrong.
+  target_vector <- c(1, -1,  1, -1,  1, -1 ) #? c(1, -2,  3, -4,  5, -6 )
+  sign_penalty <- sum(10 * (sign(coef_vector) != sign(target_vector)))
+  rmse <- sqrt(mean((coef_vector - target_vector)^2))
+  sign_penalty + rmse
+}
+
+
+score_parameters <- function(par, ...){
+  
+  df <- simulate_with_pars(par, node_parents, ...)
+  
+  coef_vector <- get_coef_vector_for_dataframe(df)
+  
+  v_score(coef_vector)
+}
+```
+
+
+```{r}
+set.seed(42)
+
+par <- runif(11, min=-0.1, max=0.1)
+
+results <- optim(par, score_parameters, method='SANN', 
+                 control=list(maxit=5000))
+
+mssp <- results$par %>% simulate_with_pars(node_parents, num_rows=1000)
+
+mssp_test <- results$par %>% simulate_with_pars(node_parents, num_rows=1000) # independent test set for later use
+
+mssp %>% get_coef_vector_for_dataframe
+```
+
+
+```{r}
+display(mssp)
+```
+
+
+```{r}
+%md
+
+The coefficient of __X__ for predicting __Y__ changes sign depending on what covariates are included in the analysis
+```
+
+
+```{r}
+fit  <- lm(Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5, mssp)
+coef(fit)
+```
+
+
+```{r}
+coef( lm(Y ~ X, mssp) )['X'] %>% print
+coef( lm(Y ~ X + Z1, mssp) )['X'] %>% print
+coef( lm(Y ~ X + Z1 + Z2, mssp) )['X'] %>% print
+coef( lm(Y ~ X + Z1 + Z2 + Z3, mssp) )['X'] %>% print
+coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4, mssp) )['X'] %>% print
+coef( lm(Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5, mssp) )['X'] %>% print
+```
+
+
+```{r}
+lm_formulae <- c(
+  Y ~ X, 
+  Y ~ X + Z1, 
+  Y ~ X + Z1 + Z2, 
+  Y ~ X + Z1 + Z2 + Z3, 
+  Y ~ X + Z1 + Z2 + Z3 + Z4, 
+  Y ~ X + Z1 + Z2 + Z3 + Z4 + Z5
+)
+
+
+lm_fits <- lm_formulae %>%
+  setNames(nm=.) %>%
+  lapply(lm, mssp)
+
+
+lm_fits %>% lapply(coef) %>% lapply('[[', 'X')
+```
+
+
+```{r}
+%md
+
+## How well can linear regression models predict the outcome?
+```
+
+
+```{r}
+
+rmse <- function(a, b) sqrt(mean( (a - b)^2 ))
+
+fit <- lm_fits[[1]]
+
+evaluate_fit <- function(fit){
+  pred <- predict(fit, mssp_test)
+  obs <- mssp_test[['Y']]
+  rmse(obs, pred)
+}
+
+lm_fits %>% lapply(evaluate_fit)
+
+```
+
+
+```{r}
+%md
+
+## Prediction sensitivity
+
+Create a modified test set where the value of X is changed by a small fixed amount and measure the difference in thepredicted outcome.
+```
+
+
+```{r}
+get_mean_response <- function(my_fit, delta_X){
+  mssp_delta <- mssp_test
+  mssp_delta['X'] <- mssp_test[['X']] + delta_X
+
+  pred <- predict(my_fit, mssp_delta)
+  delta_Y <- pred - mssp_delta[['Y']]
+
+  mean(delta_Y)
+}
+
+my_deltas <- c(-0.8, -0.4, -0.2, -0.1, 0, 0.1, 0.2, 0.4, 0.8)
+
+mean_responses <- list()
+for (my_fit in lm_fits){
+  model_name <- formula(my_fit) %>% deparse
+  # cat( paste("model:", model_name, '\n') )
+  for (dX in my_deltas){
+    # cat( paste('  delta_X:', dX, '\n') )
+    mean_responses[[model_name]][as.character(dX)] <- get_mean_response(my_fit, dX)
+  }
+}
+```
+
+
+```{r}
+mean_responses
+```
+
+
+```{r}
+sensitivity_df <- mean_responses %>% as.data.frame
+
+sensitivity_df
+```
+
+
+```{r}
+names(sensitivity_df) <- sensitivity_df %>% 
+  names %>% 
+  strsplit('\\.+') %>% 
+  lapply(function(v) grep('^[XZ]', sort(v), value=TRUE)) %>% 
+  sapply(paste, collapse='_')
+
+sensitivity_df['delta_X'] <- row.names(sensitivity_df) %>% as.numeric
+
+sensitivity_df
+```
+
+
+```{r}
+library(tidyr)
+library(ggplot2)
+
+sensitivity_df %>% 
+  pivot_longer(!delta_X, names_to = "predictors", values_to = "delta_Y") %>%
+  ggplot(aes(x=delta_X, y=delta_Y, col=predictors)) + geom_point(size=5, alpha=0.8)
+```
+
+
+```{r}
+# my_fit$coefficients %>% '['(2:length(my_fit$coefficients)) %>% names %>% paste(collapse='_')
+mean_responses = list()
+model_name <- formula(my_fit) %>% deparse
+
+mean_responses[model_name] = list()
+```
+
+
+```{r}
+model_name
+```
+
+
+```{r}
+%md
+
+# Explore dataset with EBM
+
+Feature importance is not the same as sensitivity; it doesn't really tell us if increasing X will increase or decrease Y. EBMs model the joint effect of covariates as interactions, so we could need to combine the effect of X alone with the effects of X in combination with the other covariates to predict the effect of the change.
+
+I expect that EBMs will also have a hard time capturing the effects of multiple covariates, since it is hard to represent them as a set of two-way interactions. We could try to address this by measuring how well the EBM can predict Y from a set of predictors, compared to the predictions made by the lonear regression. I expect the linear regression can do better when there is a large number of interacting predictors.
+```
+
+
+```{r}
+%r
+
+# Push MSSP data to database
+
+mssp %>% createDataFrame %>% createOrReplaceTempView(viewName = "mssp")
+
+mssp_test %>% createDataFrame %>% createOrReplaceTempView(viewName = "mssp_test")
+```
+
+
+```{r}
+%python
+
+from interpret.glassbox import ExplainableBoostingRegressor # ExplainableBoostingClassifier
+from interpret import show
+
+mssp = spark.sql("select * from mssp").toPandas()
+
+predictors_X = mssp[ ['X'] ]
+outcome = mssp['Y']
+
+ebm_X = ExplainableBoostingRegressor()
+ebm_X.fit(predictors_X, outcome)
+
+
+ebm_X_global = ebm_X.explain_global()
+show(ebm_X_global)
+```
+
+
+```{r}
+%python
+
+predictors_X_Z1 = mssp[ ['X', 'Z1'] ]
+outcome = mssp['Y']
+
+ebm_X_Z1 = ExplainableBoostingRegressor()
+ebm_X_Z1.fit(predictors_X_Z1, outcome)
+
+ebm_X_Z1_global = ebm_X_Z1.explain_global()
+show(ebm_X_Z1_global)
+```
+
+
+```{r}
+%python
+
+predictors_X_Z1_Z2 = mssp[ ['X', 'Z1', 'Z2'] ]
+outcome = mssp['Y']
+
+ebm_X_Z1_Z2 = ExplainableBoostingRegressor()
+ebm_X_Z1_Z2.fit(predictors_X_Z1_Z2, outcome)
+
+ebm_X_Z1_Z2_global = ebm_X_Z1_Z2.explain_global()
+show(ebm_X_Z1_Z2_global)
+```
+
+
+```{r}
+%md
+
+## EBM Sensitivity
+```
+
+
+```{r}
+%python
+import numpy as np
+
+from interpret.glassbox import ExplainableBoostingRegressor # ExplainableBoostingClassifier
+from interpret import show
+
+mssp = spark.sql("select * from mssp").toPandas()
+inputs = ['X', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5']
+
+
+
+def get_mean_dY(actual, predicted):
+  return np.mean(np.array(actual) - np.array(predicted))
+
+
+def evaluate_delta(delta_X, my_inputs):
+  outcome = mssp['Y'].copy()
+  predictors = mssp[ my_inputs ].copy()
+
+  ebm_dX = ExplainableBoostingRegressor()
+  ebm_dX.fit(predictors, outcome)
+
+  modified_predictors = predictors.copy()
+  modified_predictors['X'] = modified_predictors['X'] + delta_X
+
+  predicted_outcome = ebm_dX.predict(modified_predictors)
+
+  delta_Y = get_mean_dY(outcome, predicted_outcome)
+  return {'inputs': '+'.join(my_inputs), 'delta_X': delta_X, 'delta_Y': delta_Y}
+
+
+result_rows = []
+for num_inputs in range(1, len(inputs)+1):
+  these_inputs = inputs[0:num_inputs]
+  for delta_X in np.linspace(-50, 50, 21):
+    result_rows.append( evaluate_delta(delta_X, these_inputs) )
+```
+
+
+```{r}
+%python
+
+import pandas as pd
+
+results = pd.DataFrame( result_rows )
+
+results[results['inputs'] == 'X']
+```
+
+
+```{r}
+%python
+
+set(results['inputs'])
+```
+
+
+```{r}
+%python
+
+import matplotlib.pyplot as plt
+
+input_colors = {'X': '#F78E87', 
+                'X+Z1': '#C2AF30', 
+                'X+Z1+Z2': '#30C55C', 
+                'X+Z1+Z2+Z3': '#30C9CD', 
+                'X+Z1+Z2+Z3+Z4': '#7DADFC', 
+                'X+Z1+Z2+Z3+Z4+Z5': '#F480E6'}
+
+results.plot.scatter(x='delta_X', y='delta_Y', c=[input_colors[x] for x in results['inputs']])
+
+i = 0
+for c in input_colors.keys():
+  plt.text(-45, -(10+i), c, color=input_colors[c])
+  i += 2
+```
+
+
+```{r}
+%python
+?plt.text
+
+```
+
+
+```{r}
+
+```
+
