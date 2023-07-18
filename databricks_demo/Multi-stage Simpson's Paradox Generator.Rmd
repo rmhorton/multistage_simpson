@@ -331,9 +331,9 @@ par <- runif(11, min=-0.1, max=0.1)
 results <- optim(par, score_parameters, method='SANN', 
                  control=list(maxit=5000))
 
-mssp <- results$par %>% simulate_with_pars(node_parents, num_rows=1000)
+mssp <- results$par %>% simulate_with_pars(node_parents, num_rows=10000)
 
-mssp_test <- results$par %>% simulate_with_pars(node_parents, num_rows=1000) # independent test set for later use
+mssp_test <- results$par %>% simulate_with_pars(node_parents, num_rows=10000) # independent test set for later use
 
 mssp %>% get_coef_vector_for_dataframe
 ```
@@ -476,7 +476,7 @@ library(ggplot2)
 
 sensitivity_df %>% 
   pivot_longer(!delta_X, names_to = "predictors", values_to = "delta_Y") %>%
-  ggplot(aes(x=delta_X, y=delta_Y, col=predictors)) + geom_point(size=5, alpha=0.8)
+  ggplot(aes(x=delta_X, y=delta_Y, col=predictors)) + geom_point(size=5, alpha=0.8) + geom_line(linetype='dashed')
 ```
 
 
@@ -573,12 +573,15 @@ show(ebm_X_Z1_Z2_global)
 
 ```{r}
 %python
+
+import pandas as pd
 import numpy as np
 
 from interpret.glassbox import ExplainableBoostingRegressor # ExplainableBoostingClassifier
 from interpret import show
 
 mssp = spark.sql("select * from mssp").toPandas()
+mssp_test = spark.sql("select * from mssp_test").toPandas()
 inputs = ['X', 'Z1', 'Z2', 'Z3', 'Z4', 'Z5']
 
 
@@ -587,52 +590,48 @@ def get_mean_dY(actual, predicted):
   return np.mean(np.array(actual) - np.array(predicted))
 
 
-def evaluate_delta(delta_X, my_inputs):
-  outcome = mssp['Y'].copy()
-  predictors = mssp[ my_inputs ].copy()
+def evaluate_delta(my_inputs, my_deltas, my_test_set):
+  outcome = my_test_set['Y'].copy()
+  predictors = my_test_set[ my_inputs ].copy()
 
   ebm_dX = ExplainableBoostingRegressor()
   ebm_dX.fit(predictors, outcome)
 
-  modified_predictors = predictors.copy()
-  modified_predictors['X'] = modified_predictors['X'] + delta_X
+  my_results_list = []
+  for delta_X in my_deltas:
+    modified_predictors = predictors.copy()
+    modified_predictors['X'] = modified_predictors['X'] + delta_X
 
-  predicted_outcome = ebm_dX.predict(modified_predictors)
+    predicted_outcome = ebm_dX.predict(modified_predictors)
 
-  delta_Y = get_mean_dY(outcome, predicted_outcome)
-  return {'inputs': '+'.join(my_inputs), 'delta_X': delta_X, 'delta_Y': delta_Y}
+    delta_Y = get_mean_dY(outcome, predicted_outcome)
+
+    my_results = {'inputs': '+'.join(my_inputs), 'delta_X': delta_X, 'delta_Y': delta_Y}
+    my_results_list.append(my_results)
+
+  my_results_df = pd.DataFrame(my_results_list)
+  return my_results_df
 
 
-result_rows = []
+result_dfs = []
+deltas = np.linspace(-50, 50, 21)
 for num_inputs in range(1, len(inputs)+1):
   these_inputs = inputs[0:num_inputs]
-  for delta_X in np.linspace(-50, 50, 21):
-    result_rows.append( evaluate_delta(delta_X, these_inputs) )
+  result_dfs.append( evaluate_delta(these_inputs, deltas, mssp) )
+
+results = pd.concat( result_dfs )
+
+results
 ```
 
 
 ```{r}
 %python
-
-import pandas as pd
-
-results = pd.DataFrame( result_rows )
-
-results[results['inputs'] == 'X']
-```
-
-
-```{r}
-%python
-
-set(results['inputs'])
-```
-
-
-```{r}
-%python
-
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+
+# plt.figure(figsize=(1000, 10000))
+mpl.rcParams['figure.dpi'] = 200
 
 input_colors = {'X': '#F78E87', 
                 'X+Z1': '#C2AF30', 
@@ -641,19 +640,22 @@ input_colors = {'X': '#F78E87',
                 'X+Z1+Z2+Z3+Z4': '#7DADFC', 
                 'X+Z1+Z2+Z3+Z4+Z5': '#F480E6'}
 
-results.plot.scatter(x='delta_X', y='delta_Y', c=[input_colors[x] for x in results['inputs']])
+point_colors = [input_colors[x] for x in results['inputs']]
+ax = results.plot.scatter(x='delta_X', y='delta_Y', c=point_colors, s=80)
+# ax = results.plot.line(x='delta_X', y='delta_Y', style='k')
 
 i = 0
-for c in input_colors.keys():
-  plt.text(-45, -(10+i), c, color=input_colors[c])
+for my_formula in input_colors.keys():
+  plt.text(-20, -(14+i), my_formula, color=input_colors[my_formula])
+  results[ results['inputs'] == my_formula ].plot.line(x='delta_X', y='delta_Y', ax=ax, style='--k', legend=False)
   i += 2
 ```
 
 
 ```{r}
-%python
-?plt.text
+%r
 
+results
 ```
 
 
